@@ -254,6 +254,8 @@ storageClass:
   delete:
     isDefault: false
     allowVolumeExpansion: true
+    fstype: ext4
   retain:
     isDefault: false
     allowVolumeExpansion: true
+    fstype: ext4
