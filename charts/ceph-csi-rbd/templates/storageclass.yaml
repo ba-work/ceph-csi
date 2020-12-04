@@ -35,7 +35,7 @@ metadata:
 provisioner: rbd.csi.ceph.com
 parameters:
   clusterID: {{ (index .Values.csiConfig 0).clusterID }}
-  pool: {{ .Values.pool }}
+  pool: {{ .Values.storageClass.pool }}
   imageFeatures: layering
   csi.storage.k8s.io/provisioner-secret-name: {{ .Values.secret.name }}
   csi.storage.k8s.io/provisioner-secret-namespace: {{ .Values.secret.namespace }}

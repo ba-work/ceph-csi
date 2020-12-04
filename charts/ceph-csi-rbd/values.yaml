@@ -250,6 +250,7 @@ secret:
     passphrase:
 
 storageClass:
+  pool:
   enabled: true
   delete:
     isDefault: false
