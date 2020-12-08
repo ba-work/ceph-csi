@@ -209,3 +209,30 @@ configMapName: ceph-csi-config
 # configMapKey:
 # Use an externally provided configmap
 externallyManagedConfigmap: false
+
+
+secret:
+  enabled: true
+  name: csi-rbd-secret
+  namespace: default
+  # Key values correspond to a user name and its key, as defined in the
+  # ceph cluster. User ID should have required access to the 'pool'
+  userID:
+  userKey:
+  encryption:
+    enabled: false
+    # Encryption passphrase
+    passphrase:
+
+storageClass:
+  pool:
+  fsName:
+  enabled: true
+  delete:
+    isDefault: false
+    allowVolumeExpansion: true
+    fstype: ext4
+  retain:
+    isDefault: false
+    allowVolumeExpansion: true
+    fstype: ext4
