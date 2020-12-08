@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 
 	ctrl "github.com/ceph/ceph-csi/internal/controller"
 	"github.com/ceph/ceph-csi/internal/rbd"
@@ -80,7 +81,14 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	return nil
 }
 
-func (r *ReconcilePersistentVolume) getCredentials(name, namespace string) (map[string]string, error) {
+func (r *ReconcilePersistentVolume) getCredentials(name, namespace string) (*util.Credentials, error) {
+	var cr *util.Credentials
+
+	if name == "" || namespace == "" {
+		errStr := "secret name or secret namespace is empty"
+		util.ErrorLogMsg(errStr)
+		return nil, errors.New(errStr)
+	}
 	secret := &corev1.Secret{}
 	err := r.client.Get(context.TODO(), types.NamespacedName{Name: name, Namespace: namespace}, secret)
 	if err != nil {
@@ -91,7 +99,27 @@ func (r *ReconcilePersistentVolume) getCredentials(name, namespace string) (map[
 	for key, value := range secret.Data {
 		credentials[key] = string(value)
 	}
-	return credentials, nil
+
+	cr, err = util.NewUserCredentials(credentials)
+	if err != nil {
+		util.ErrorLogMsg("failed to get user credentials %s", err)
+		return nil, err
+	}
+	return cr, nil
+}
+
+func checkStaticVolume(pv *corev1.PersistentVolume) (bool, error) {
+	static := false
+	var err error
+
+	staticVol := pv.Spec.CSI.VolumeAttributes["staticVolume"]
+	if staticVol != "" {
+		static, err = strconv.ParseBool(staticVol)
+		if err != nil {
+			return false, fmt.Errorf("failed to parse preProvisionedVolume: %w", err)
+		}
+	}
+	return static, nil
 }
 
 // reconcilePV will extract the image details from the pv spec and regenerates
@@ -109,7 +137,15 @@ func (r ReconcilePersistentVolume) reconcilePV(obj runtime.Object) error {
 		volumeHandler := pv.Spec.CSI.VolumeHandle
 		secretName := ""
 		secretNamespace := ""
-
+		// check static volume
+		static, err := checkStaticVolume(pv)
+		if err != nil {
+			return err
+		}
+		// if the volume is static, dont generate OMAP data
+		if static {
+			return nil
+		}
 		if pv.Spec.CSI.ControllerExpandSecretRef != nil {
 			secretName = pv.Spec.CSI.ControllerExpandSecretRef.Name
 			secretNamespace = pv.Spec.CSI.ControllerExpandSecretRef.Namespace
@@ -117,23 +153,14 @@ func (r ReconcilePersistentVolume) reconcilePV(obj runtime.Object) error {
 			secretName = pv.Spec.CSI.NodeStageSecretRef.Name
 			secretNamespace = pv.Spec.CSI.NodeStageSecretRef.Namespace
 		}
-		if secretName == "" || secretNamespace == "" {
-			errStr := "secretname or secret namespace is empty"
-			util.ErrorLogMsg(errStr)
-			return errors.New(errStr)
-		}
 
-		secrets, err := r.getCredentials(secretName, secretNamespace)
+		cr, err := r.getCredentials(secretName, secretNamespace)
 		if err != nil {
-			util.ErrorLogMsg("failed to get secrets %s", err)
-			return err
-		}
-		cr, err := util.NewUserCredentials(secrets)
-		if err != nil {
-			util.ErrorLogMsg("failed to get user credentials %s", err)
+			util.ErrorLogMsg("failed to get credentials %s", err)
 			return err
 		}
 		defer cr.DeleteCredentials()
+
 		err = rbd.RegenerateJournal(imageName, volumeHandler, pool, journalPool, requestName, cr)
 		if err != nil {
 			util.ErrorLogMsg("failed to regenerate journal %s", err)

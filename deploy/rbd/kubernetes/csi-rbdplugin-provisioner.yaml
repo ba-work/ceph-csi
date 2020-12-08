@@ -42,15 +42,17 @@ spec:
       serviceAccount: rbd-csi-provisioner
       containers:
         - name: csi-provisioner
-          image: k8s.gcr.io/sig-storage/csi-provisioner:v1.6.0
+          image: k8s.gcr.io/sig-storage/csi-provisioner:v2.0.4
           args:
             - "--csi-address=$(ADDRESS)"
             - "--v=5"
             - "--timeout=150s"
             - "--retry-interval-start=500ms"
-            - "--enable-leader-election=true"
-            - "--leader-election-type=leases"
-            - "--feature-gates=Topology=true"
+            - "--leader-election=true"
+            #  set it to true to use topology based provisioning
+            - "--feature-gates=Topology=false"
+            # if fstype is not specified in storageclass, ext4 is default
+            - "--default-fstype=ext4"
           env:
             - name: ADDRESS
               value: unix:///csi/csi-provisioner.sock
@@ -59,7 +61,7 @@ spec:
             - name: socket-dir
               mountPath: /csi
         - name: csi-snapshotter
-          image: k8s.gcr.io/sig-storage/csi-snapshotter:v2.1.0
+          image: k8s.gcr.io/sig-storage/csi-snapshotter:v3.0.2
           args:
             - "--csi-address=$(ADDRESS)"
             - "--v=5"
@@ -75,7 +77,7 @@ spec:
             - name: socket-dir
               mountPath: /csi
         - name: csi-attacher
-          image: k8s.gcr.io/sig-storage/csi-attacher:v2.2.0
+          image: k8s.gcr.io/sig-storage/csi-attacher:v3.0.2
           args:
             - "--v=5"
             - "--csi-address=$(ADDRESS)"
@@ -89,13 +91,14 @@ spec:
             - name: socket-dir
               mountPath: /csi
         - name: csi-resizer
-          image: k8s.gcr.io/sig-storage/csi-resizer:v0.5.0
+          image: k8s.gcr.io/sig-storage/csi-resizer:v1.0.1
           args:
             - "--csi-address=$(ADDRESS)"
             - "--v=5"
-            - "--csiTimeout=150s"
+            - "--timeout=150s"
             - "--leader-election"
             - "--retry-interval-start=500ms"
+            - "--handle-volume-inuse-error=false"
           env:
             - name: ADDRESS
               value: unix:///csi/csi-provisioner.sock

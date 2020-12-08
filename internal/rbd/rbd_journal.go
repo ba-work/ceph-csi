@@ -543,14 +543,8 @@ func RegenerateJournal(imageName, volumeID, pool, journalPool, requestName strin
 		rbdVol.ReservedID = imageData.ImageUUID
 		rbdVol.ImageID = imageData.ImageAttributes.ImageID
 		if rbdVol.ImageID == "" {
-			err = rbdVol.getImageID()
+			err = rbdVol.storeImageID(ctx, j)
 			if err != nil {
-				util.ErrorLog(ctx, "failed to get image id %s: %v", rbdVol, err)
-				return err
-			}
-			err = j.StoreImageID(ctx, rbdVol.JournalPool, rbdVol.ReservedID, rbdVol.ImageID)
-			if err != nil {
-				util.ErrorLog(ctx, "failed to store volume id %s: %v", rbdVol, err)
 				return err
 			}
 		}
@@ -559,6 +553,8 @@ func RegenerateJournal(imageName, volumeID, pool, journalPool, requestName strin
 			util.ErrorLog(ctx, "failed to add UUID mapping %s: %v", rbdVol, err)
 			return err
 		}
+		// As the omap already exists for this image ID return nil.
+		return nil
 	}
 
 	rbdVol.ReservedID, rbdVol.RbdImageName, err = j.ReserveName(
@@ -568,6 +564,15 @@ func RegenerateJournal(imageName, volumeID, pool, journalPool, requestName strin
 		return err
 	}
 
+	defer func() {
+		if err != nil {
+			undoErr := j.UndoReservation(ctx, rbdVol.JournalPool, rbdVol.Pool,
+				rbdVol.RbdImageName, rbdVol.RequestName)
+			if undoErr != nil {
+				util.ErrorLog(ctx, "failed to undo reservation %s: %v", rbdVol, undoErr)
+			}
+		}
+	}()
 	rbdVol.VolID, err = util.GenerateVolID(ctx, rbdVol.Monitors, cr, imagePoolID, rbdVol.Pool,
 		rbdVol.ClusterID, rbdVol.ReservedID, volIDVersion)
 	if err != nil {
@@ -577,20 +582,29 @@ func RegenerateJournal(imageName, volumeID, pool, journalPool, requestName strin
 	util.DebugLog(ctx, "re-generated Volume ID (%s) and image name (%s) for request name (%s)",
 		rbdVol.VolID, rbdVol.RbdImageName, rbdVol.RequestName)
 	if rbdVol.ImageID == "" {
-		err = rbdVol.getImageID()
+		err = rbdVol.storeImageID(ctx, j)
 		if err != nil {
-			util.ErrorLog(ctx, "failed to get image id %s: %v", rbdVol, err)
-			return err
-		}
-		err = j.StoreImageID(ctx, rbdVol.JournalPool, rbdVol.ReservedID, rbdVol.ImageID)
-		if err != nil {
-			util.ErrorLog(ctx, "failed to store volume id %s: %v", rbdVol, err)
 			return err
 		}
 	}
 
 	if volumeID != rbdVol.VolID {
 		return j.ReserveNewUUIDMapping(ctx, rbdVol.JournalPool, volumeID, rbdVol.VolID)
+	}
+	return nil
+}
+
+// storeImageID retrieves the image ID and stores it in OMAP.
+func (rv *rbdVolume) storeImageID(ctx context.Context, j *journal.Connection) error {
+	err := rv.getImageID()
+	if err != nil {
+		util.ErrorLog(ctx, "failed to get image id %s: %v", rv, err)
+		return err
+	}
+	err = j.StoreImageID(ctx, rv.JournalPool, rv.ReservedID, rv.ImageID)
+	if err != nil {
+		util.ErrorLog(ctx, "failed to store volume id %s: %v", rv, err)
+		return err
 	}
 	return nil
 }
