@@ -182,7 +182,7 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		var imageAttributes *journal.ImageAttributes
 		err = vi.DecomposeCSIID(volID)
 		if err != nil {
-			err = fmt.Errorf("error decoding volume ID (%s) (%s)", err, volID)
+			err = fmt.Errorf("error decoding volume ID (%s): %w", volID, err)
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 
@@ -196,7 +196,7 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		imageAttributes, err = j.GetImageAttributes(
 			ctx, volOptions.Pool, vi.ObjectUUID, false)
 		if err != nil {
-			err = fmt.Errorf("error fetching image attributes for volume ID (%s) (%s)", err, volID)
+			err = fmt.Errorf("error fetching image attributes for volume ID (%s): %w", volID, err)
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 		volOptions.RbdImageName = imageAttributes.ImageName
@@ -735,7 +735,7 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 	resizer := resizefs.NewResizeFs(diskMounter)
 	ok, err := resizer.Resize(devicePath, volumePath)
 	if !ok {
-		return nil, fmt.Errorf("rbd: resize failed on path %s, error: %v", req.GetVolumePath(), err)
+		return nil, status.Errorf(codes.Internal, "rbd: resize failed on path %s, error: %v", req.GetVolumePath(), err)
 	}
 	return &csi.NodeExpandVolumeResponse{}, nil
 }
@@ -796,14 +796,14 @@ func (ns *NodeServer) processEncryptedDevice(ctx context.Context, volOptions *rb
 		var existingFormat string
 		existingFormat, err = diskMounter.GetDiskFormat(devicePath)
 		if err != nil {
-			return "", fmt.Errorf("failed to get disk format for path %s, error: %v", devicePath, err)
+			return "", fmt.Errorf("failed to get disk format for path %s: %w", devicePath, err)
 		}
 
 		switch existingFormat {
 		case "":
 			err = encryptDevice(ctx, volOptions, devicePath)
 			if err != nil {
-				return "", fmt.Errorf("failed to encrypt rbd image %s: %v", imageSpec, err)
+				return "", fmt.Errorf("failed to encrypt rbd image %s: %w", imageSpec, err)
 			}
 		case "crypt":
 			util.WarningLog(ctx, "rbd image %s is encrypted, but encryption state was not updated",
@@ -838,7 +838,7 @@ func encryptDevice(ctx context.Context, rbdVol *rbdVolume, devicePath string) er
 	}
 
 	if err = util.EncryptVolume(ctx, devicePath, passphrase); err != nil {
-		err = fmt.Errorf("failed to encrypt volume %s: %v", rbdVol, err)
+		err = fmt.Errorf("failed to encrypt volume %s: %w", rbdVol, err)
 		util.ErrorLog(ctx, err.Error())
 		return err
 	}
