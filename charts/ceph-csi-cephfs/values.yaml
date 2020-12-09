@@ -219,6 +219,8 @@ secret:
   # ceph cluster. User ID should have required access to the 'pool'
   userID:
   userKey:
+  adminID:
+  adminKey:
   encryption:
     enabled: false
     # Encryption passphrase
