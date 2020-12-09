@@ -35,7 +35,7 @@ func k8sGetNodeLabels(nodeName string) (map[string]string, error) {
 	client := NewK8sClient()
 	node, err := client.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to get node (%s) information : %v", nodeName, err)
+		return nil, fmt.Errorf("failed to get node %q information: %w", nodeName, err)
 	}
 
 	return node.GetLabels(), nil
@@ -53,13 +53,13 @@ func GetTopologyFromDomainLabels(domainLabels, nodeName, driverName string) (map
 	topologyPrefix := strings.ToLower("topology." + driverName)
 	const lenLimit = 63
 	if len(topologyPrefix) > lenLimit {
-		return nil, fmt.Errorf("computed topology label prefix (%s) for node exceeds length limits", topologyPrefix)
+		return nil, fmt.Errorf("computed topology label prefix %q for node exceeds length limits", topologyPrefix)
 	}
 	// driverName is validated, and we are adding a lowercase "topology." to it, so no validation for conformance
 
 	// Convert passed in labels to a map, and check for uniqueness
 	labelsToRead := strings.SplitN(domainLabels, labelSeparator, -1)
-	DefaultLog("passed in node labels for processing : %+v", labelsToRead)
+	DefaultLog("passed in node labels for processing: %+v", labelsToRead)
 
 	labelsIn := make(map[string]bool)
 	labelCount := 0
@@ -67,7 +67,7 @@ func GetTopologyFromDomainLabels(domainLabels, nodeName, driverName string) (map
 		// as we read the labels from k8s, and check for missing labels,
 		// no label conformance checks here
 		if _, ok := labelsIn[label]; ok {
-			return nil, fmt.Errorf("duplicate label (%s) found in domain labels", label)
+			return nil, fmt.Errorf("duplicate label %q found in domain labels", label)
 		}
 
 		labelsIn[label] = true
@@ -102,10 +102,10 @@ func GetTopologyFromDomainLabels(domainLabels, nodeName, driverName string) (map
 				missingLabels = append(missingLabels, key)
 			}
 		}
-		return nil, fmt.Errorf("missing domain labels %v on node (%s)", missingLabels, nodeName)
+		return nil, fmt.Errorf("missing domain labels %v on node %q", missingLabels, nodeName)
 	}
 
-	DefaultLog("list of domains processed : %+v", domainMap)
+	DefaultLog("list of domains processed: %+v", domainMap)
 
 	topology := make(map[string]string)
 	for domain, value := range domainMap {

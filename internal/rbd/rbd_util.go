@@ -105,7 +105,9 @@ type rbdVolume struct {
 	readOnly            bool
 	Primary             bool
 	KMS                 util.EncryptionKMS
-	CreatedAt           *timestamp.Timestamp
+	// Owner is the creator (tenant, Kubernetes Namespace) of the volume.
+	Owner     string
+	CreatedAt *timestamp.Timestamp
 	// conn is a connection to the Ceph cluster obtained from a ConnPool
 	conn *util.ClusterConnection
 	// an opened IOContext, call .openIoctx() before using
@@ -734,6 +736,7 @@ func genVolFromVolID(ctx context.Context, volumeID string, cr *util.Credentials,
 	rbdVol.RbdImageName = imageAttributes.ImageName
 	rbdVol.ReservedID = vi.ObjectUUID
 	rbdVol.ImageID = imageAttributes.ImageID
+	rbdVol.Owner = imageAttributes.Owner
 
 	if imageAttributes.KmsID != "" {
 		rbdVol.Encrypted = true
@@ -813,6 +816,15 @@ func genVolFromVolumeOptions(ctx context.Context, volOptions, credentials map[st
 		rbdVol.Mounter = rbdDefaultMounter
 	}
 
+	// if the KMS is of type VaultToken, additional metadata is needed
+	// depending on the tenant, the KMS can be configured with other
+	// options
+	// FIXME: this works only on Kubernetes, how do other CO supply metadata?
+	rbdVol.Owner, ok = volOptions["csi.storage.k8s.io/pvc/namespace"]
+	if !ok {
+		util.DebugLog(ctx, "could not detect owner for %s", rbdVol.String())
+	}
+
 	rbdVol.Encrypted = false
 	encrypted, ok = volOptions["encrypted"]
 	if ok {
@@ -828,7 +840,7 @@ func genVolFromVolumeOptions(ctx context.Context, volOptions, credentials map[st
 			kmsID := volOptions["encryptionKMSID"]
 			rbdVol.KMS, err = util.GetKMS(kmsID, credentials)
 			if err != nil {
-				return nil, fmt.Errorf("invalid encryption kms configuration: %s", err)
+				return nil, fmt.Errorf("invalid encryption kms configuration: %w", err)
 			}
 		}
 	}
@@ -1022,7 +1034,7 @@ func (rv *rbdVolume) updateVolWithImageInfo() error {
 	if stdout != "" {
 		err = json.Unmarshal([]byte(stdout), &imgInfo)
 		if err != nil {
-			return fmt.Errorf("unmarshal failed: %+v.  raw buffer response: %s", err, stdout)
+			return fmt.Errorf("unmarshal failed (%w), raw buffer response: %s", err, stdout)
 		}
 		rv.Primary = imgInfo.Mirroring.Primary
 	}
@@ -1097,13 +1109,13 @@ func stashRBDImageMetadata(volOptions *rbdVolume, path string) error {
 
 	encodedBytes, err := json.Marshal(imgMeta)
 	if err != nil {
-		return fmt.Errorf("failed to marshall JSON image metadata for image (%s): (%v)", volOptions, err)
+		return fmt.Errorf("failed to marshall JSON image metadata for image (%s): %w", volOptions, err)
 	}
 
 	fPath := filepath.Join(path, stashFileName)
 	err = ioutil.WriteFile(fPath, encodedBytes, 0600)
 	if err != nil {
-		return fmt.Errorf("failed to stash JSON image metadata for image (%s) at path (%s): (%v)", volOptions, fPath, err)
+		return fmt.Errorf("failed to stash JSON image metadata for image (%s) at path (%s): %w", volOptions, fPath, err)
 	}
 
 	return nil
@@ -1117,7 +1129,7 @@ func lookupRBDImageMetadataStash(path string) (rbdImageMetadataStash, error) {
 	encodedBytes, err := ioutil.ReadFile(fPath) // #nosec - intended reading from fPath
 	if err != nil {
 		if !os.IsNotExist(err) {
-			return imgMeta, fmt.Errorf("failed to read stashed JSON image metadata from path (%s): (%v)", fPath, err)
+			return imgMeta, fmt.Errorf("failed to read stashed JSON image metadata from path (%s): %w", fPath, err)
 		}
 
 		return imgMeta, util.JoinErrors(ErrMissingStash, err)
@@ -1125,7 +1137,7 @@ func lookupRBDImageMetadataStash(path string) (rbdImageMetadataStash, error) {
 
 	err = json.Unmarshal(encodedBytes, &imgMeta)
 	if err != nil {
-		return imgMeta, fmt.Errorf("failed to unmarshall stashed JSON image metadata from path (%s): (%v)", fPath, err)
+		return imgMeta, fmt.Errorf("failed to unmarshall stashed JSON image metadata from path (%s): %w", fPath, err)
 	}
 
 	return imgMeta, nil
@@ -1135,7 +1147,7 @@ func lookupRBDImageMetadataStash(path string) (rbdImageMetadataStash, error) {
 func cleanupRBDImageMetadataStash(path string) error {
 	fPath := filepath.Join(path, stashFileName)
 	if err := os.Remove(fPath); err != nil {
-		return fmt.Errorf("failed to cleanup stashed JSON data (%s): (%v)", fPath, err)
+		return fmt.Errorf("failed to cleanup stashed JSON data (%s): %w", fPath, err)
 	}
 
 	return nil
@@ -1196,7 +1208,7 @@ func (rv *rbdVolume) checkRbdImageEncrypted(ctx context.Context) (string, error)
 func (rv *rbdVolume) ensureEncryptionMetadataSet(status string) error {
 	err := rv.SetMetadata(encryptionMetaKey, status)
 	if err != nil {
-		return fmt.Errorf("failed to save encryption status for %s: %v", rv, err)
+		return fmt.Errorf("failed to save encryption status for %s: %w", rv, err)
 	}
 
 	return nil
