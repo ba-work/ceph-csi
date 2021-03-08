@@ -55,8 +55,7 @@ func (cs *ControllerServer) createBackingVolume(
 
 	vID,
 	pvID *volumeIdentifier,
-	sID *snapshotIdentifier,
-	cr *util.Credentials) error {
+	sID *snapshotIdentifier) error {
 	var err error
 	if sID != nil {
 		if err = cs.OperationLocks.GetRestoreLock(sID.SnapshotID); err != nil {
@@ -65,7 +64,7 @@ func (cs *ControllerServer) createBackingVolume(
 		}
 		defer cs.OperationLocks.ReleaseRestoreLock(sID.SnapshotID)
 
-		err = createCloneFromSnapshot(ctx, parentVolOpt, volOptions, vID, sID, cr)
+		err = createCloneFromSnapshot(ctx, parentVolOpt, volOptions, vID, sID)
 		if err != nil {
 			util.ErrorLog(ctx, "failed to create clone from snapshot %s: %v", sID.FsSnapshotName, err)
 			return err
@@ -78,7 +77,7 @@ func (cs *ControllerServer) createBackingVolume(
 			return status.Error(codes.Aborted, err.Error())
 		}
 		defer cs.OperationLocks.ReleaseCloneLock(pvID.VolumeID)
-		err = createCloneFromSubvolume(ctx, volumeID(pvID.FsSubvolName), volumeID(vID.FsSubvolName), volOptions, parentVolOpt, cr)
+		err = createCloneFromSubvolume(ctx, volumeID(pvID.FsSubvolName), volumeID(vID.FsSubvolName), volOptions, parentVolOpt)
 		if err != nil {
 			util.ErrorLog(ctx, "failed to create clone from subvolume %s: %v", volumeID(pvID.FsSubvolName), err)
 			return err
@@ -188,7 +187,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 			// explicitly
 			err = volOptions.resizeVolume(ctx, volumeID(vID.FsSubvolName), volOptions.Size)
 			if err != nil {
-				purgeErr := purgeVolume(ctx, volumeID(vID.FsSubvolName), cr, volOptions, false)
+				purgeErr := volOptions.purgeVolume(ctx, volumeID(vID.FsSubvolName), false)
 				if purgeErr != nil {
 					util.ErrorLog(ctx, "failed to delete volume %s: %v", requestName, purgeErr)
 					// All errors other than ErrVolumeNotFound should return an error back to the caller
@@ -208,6 +207,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		}
 		volumeContext := req.GetParameters()
 		volumeContext["subvolumeName"] = vID.FsSubvolName
+		volumeContext["subvolumePath"] = volOptions.RootPath
 		volume := &csi.Volume{
 			VolumeId:      vID.VolumeID,
 			CapacityBytes: volOptions.Size,
@@ -244,17 +244,38 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}()
 
 	// Create a volume
-	err = cs.createBackingVolume(ctx, volOptions, parentVol, vID, pvID, sID, cr)
+	err = cs.createBackingVolume(ctx, volOptions, parentVol, vID, pvID, sID)
 	if err != nil {
 		if isCloneRetryError(err) {
 			return nil, status.Error(codes.Aborted, err.Error())
 		}
 		return nil, err
 	}
+
+	volOptions.RootPath, err = volOptions.getVolumeRootPathCeph(ctx, volumeID(vID.FsSubvolName))
+	if err != nil {
+		purgeErr := volOptions.purgeVolume(ctx, volumeID(vID.FsSubvolName), true)
+		if purgeErr != nil {
+			util.ErrorLog(ctx, "failed to delete volume %s: %v", vID.FsSubvolName, purgeErr)
+			// All errors other than ErrVolumeNotFound should return an error back to the caller
+			if !errors.Is(purgeErr, ErrVolumeNotFound) {
+				// If the subvolume deletion is failed, we should not cleanup
+				// the OMAP entry it will stale subvolume in cluster.
+				// set err=nil so that when we get the request again we can get
+				// the subvolume info.
+				err = nil
+				return nil, status.Error(codes.Internal, purgeErr.Error())
+			}
+		}
+		util.ErrorLog(ctx, "failed to get subvolume path %s: %v", vID.FsSubvolName, err)
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
 	util.DebugLog(ctx, "cephfs: successfully created backing volume named %s for request name %s",
 		vID.FsSubvolName, requestName)
 	volumeContext := req.GetParameters()
 	volumeContext["subvolumeName"] = vID.FsSubvolName
+	volumeContext["subvolumePath"] = volOptions.RootPath
 	volume := &csi.Volume{
 		VolumeId:      vID.VolumeID,
 		CapacityBytes: volOptions.Size,
@@ -349,7 +370,7 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 	}
 	defer cr.DeleteCredentials()
 
-	if err = purgeVolume(ctx, volumeID(vID.FsSubvolName), cr, volOptions, false); err != nil {
+	if err = volOptions.purgeVolume(ctx, volumeID(vID.FsSubvolName), false); err != nil {
 		util.ErrorLog(ctx, "failed to delete volume %s: %v", volID, err)
 		if errors.Is(err, ErrVolumeHasSnapshots) {
 			return nil, status.Error(codes.FailedPrecondition, err.Error())

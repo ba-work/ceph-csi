@@ -104,9 +104,12 @@ func (vo *volumeOptions) getSubVolumeInfo(ctx context.Context, volID volumeID) (
 	}
 	bc, ok := info.BytesQuota.(fsAdmin.ByteCount)
 	if !ok {
-		// we ignore info.BytesQuota == Infinite and just continue
-		// without returning quota information
-		if info.BytesQuota != fsAdmin.Infinite {
+		// If info.BytesQuota == Infinite (in case it is not set)
+		// or nil (in case the subvolume is in snapshot-retained state),
+		// just continue without returning quota information.
+		// TODO: make use of subvolume "state" attribute once
+		// https://github.com/ceph/go-ceph/issues/453 is fixed.
+		if !(info.BytesQuota == fsAdmin.Infinite || info.BytesQuota == nil) {
 			return nil, fmt.Errorf("subvolume %s has unsupported quota: %v", string(volID), info.BytesQuota)
 		}
 	} else {
@@ -119,9 +122,18 @@ func (vo *volumeOptions) getSubVolumeInfo(ctx context.Context, volID volumeID) (
 	return &subvol, nil
 }
 
+type operationState int64
+
+const (
+	unknown operationState = iota
+	supported
+	unsupported
+)
+
 type localClusterState struct {
-	// set true if cluster supports resize functionality.
-	resizeSupported *bool
+	// set the enum value i.e., unknown, supported,
+	// unsupported as per the state of the cluster.
+	resizeState operationState
 	// set true once a subvolumegroup is created
 	// for corresponding cluster.
 	subVolumeGroupCreated bool
@@ -183,19 +195,16 @@ func (vo *volumeOptions) resizeVolume(ctx context.Context, volID volumeID, bytes
 	}
 	// resize subvolume when either it's supported, or when corresponding
 	// clusterID key was not present.
-	if clusterAdditionalInfo[vo.ClusterID].resizeSupported == nil || *clusterAdditionalInfo[vo.ClusterID].resizeSupported {
-		if clusterAdditionalInfo[vo.ClusterID].resizeSupported == nil {
-			clusterAdditionalInfo[vo.ClusterID].resizeSupported = new(bool)
-		}
+	if clusterAdditionalInfo[vo.ClusterID].resizeState == unknown ||
+		clusterAdditionalInfo[vo.ClusterID].resizeState == supported {
 		fsa, err := vo.conn.GetFSAdmin()
 		if err != nil {
 			util.ErrorLog(ctx, "could not get FSAdmin, can not resize volume %s:", vo.FsName, err)
 			return err
 		}
-
 		_, err = fsa.ResizeSubVolume(vo.FsName, vo.SubvolumeGroup, string(volID), fsAdmin.ByteCount(bytesQuota), true)
 		if err == nil {
-			*clusterAdditionalInfo[vo.ClusterID].resizeSupported = true
+			clusterAdditionalInfo[vo.ClusterID].resizeState = supported
 			return nil
 		}
 		var invalid fsAdmin.NotImplementedError
@@ -205,38 +214,31 @@ func (vo *volumeOptions) resizeVolume(ctx context.Context, volID volumeID, bytes
 			return err
 		}
 	}
-	*clusterAdditionalInfo[vo.ClusterID].resizeSupported = false
+	clusterAdditionalInfo[vo.ClusterID].resizeState = unsupported
 	return createVolume(ctx, vo, volID, bytesQuota)
 }
 
-func purgeVolume(ctx context.Context, volID volumeID, cr *util.Credentials, volOptions *volumeOptions, force bool) error {
-	arg := []string{
-		"fs",
-		"subvolume",
-		"rm",
-		volOptions.FsName,
-		string(volID),
-		"--group_name",
-		volOptions.SubvolumeGroup,
-		"-m", volOptions.Monitors,
-		"-c", util.CephConfigPath,
-		"-n", cephEntityClientPrefix + cr.ID,
-		"--keyfile=" + cr.KeyFile,
-	}
-	if force {
-		arg = append(arg, "--force")
-	}
-	if checkSubvolumeHasFeature("snapshot-retention", volOptions.Features) {
-		arg = append(arg, "--retain-snapshots")
+func (vo *volumeOptions) purgeVolume(ctx context.Context, volID volumeID, force bool) error {
+	fsa, err := vo.conn.GetFSAdmin()
+	if err != nil {
+		util.ErrorLog(ctx, "could not get FSAdmin %s:", err)
+		return err
 	}
 
-	err := execCommandErr(ctx, "ceph", arg...)
+	opt := fsAdmin.SubVolRmFlags{}
+	opt.Force = force
+
+	if checkSubvolumeHasFeature("snapshot-retention", vo.Features) {
+		opt.RetainSnapshots = true
+	}
+
+	err = fsa.RemoveSubVolumeWithFlags(vo.FsName, vo.SubvolumeGroup, string(volID), opt)
 	if err != nil {
-		util.ErrorLog(ctx, "failed to purge subvolume %s in fs %s: %s", string(volID), volOptions.FsName, err)
+		util.ErrorLog(ctx, "failed to purge subvolume %s in fs %s: %s", string(volID), vo.FsName, err)
 		if strings.Contains(err.Error(), volumeNotEmpty) {
 			return util.JoinErrors(ErrVolumeHasSnapshots, err)
 		}
-		if strings.Contains(err.Error(), volumeNotFound) {
+		if errors.Is(err, rados.ErrNotFound) {
 			return util.JoinErrors(ErrVolumeNotFound, err)
 		}
 		return err

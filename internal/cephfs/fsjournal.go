@@ -108,7 +108,7 @@ func checkVolExists(ctx context.Context,
 			return nil, ErrClonePending
 		}
 		if cloneState == cephFSCloneFailed {
-			err = purgeVolume(ctx, volumeID(vid.FsSubvolName), cr, volOptions, true)
+			err = volOptions.purgeVolume(ctx, volumeID(vid.FsSubvolName), true)
 			if err != nil {
 				util.ErrorLog(ctx, "failed to delete volume %s: %v", vid.FsSubvolName, err)
 				return nil, err
@@ -129,16 +129,23 @@ func checkVolExists(ctx context.Context,
 		if cloneState != cephFSCloneComplete {
 			return nil, fmt.Errorf("clone is not in complete state for %s", vid.FsSubvolName)
 		}
-	} else {
-		_, err = volOptions.getVolumeRootPathCeph(ctx, volumeID(vid.FsSubvolName))
-		if err != nil {
-			if errors.Is(err, ErrVolumeNotFound) {
-				err = j.UndoReservation(ctx, volOptions.MetadataPool,
-					volOptions.MetadataPool, vid.FsSubvolName, volOptions.RequestName)
-				return nil, err
+	}
+	volOptions.RootPath, err = volOptions.getVolumeRootPathCeph(ctx, volumeID(vid.FsSubvolName))
+	if err != nil {
+		if errors.Is(err, ErrVolumeNotFound) {
+			// If the subvolume is not present, cleanup the stale snapshot
+			// created for clone.
+			if parentVolOpt != nil && pvID != nil {
+				err = cleanupCloneFromSubvolumeSnapshot(ctx, volumeID(pvID.FsSubvolName), volumeID(vid.FsSubvolName), parentVolOpt)
+				if err != nil {
+					return nil, err
+				}
 			}
+			err = j.UndoReservation(ctx, volOptions.MetadataPool,
+				volOptions.MetadataPool, vid.FsSubvolName, volOptions.RequestName)
 			return nil, err
 		}
+		return nil, err
 	}
 
 	// check if topology constraints match what is found

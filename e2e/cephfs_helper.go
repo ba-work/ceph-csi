@@ -41,14 +41,14 @@ func createCephfsStorageClass(c kubernetes.Interface, f *framework.Framework, en
 		return err
 	}
 	sc.Parameters["fsName"] = "myfs"
-	sc.Parameters["csi.storage.k8s.io/provisioner-secret-namespace"] = rookNamespace
-	sc.Parameters["csi.storage.k8s.io/provisioner-secret-name"] = cephfsProvisionerSecretName
+	sc.Parameters["csi.storage.k8s.io/provisioner-secret-namespace"] = cephCSINamespace
+	sc.Parameters["csi.storage.k8s.io/provisioner-secret-name"] = cephFSProvisionerSecretName
 
-	sc.Parameters["csi.storage.k8s.io/controller-expand-secret-namespace"] = rookNamespace
-	sc.Parameters["csi.storage.k8s.io/controller-expand-secret-name"] = cephfsProvisionerSecretName
+	sc.Parameters["csi.storage.k8s.io/controller-expand-secret-namespace"] = cephCSINamespace
+	sc.Parameters["csi.storage.k8s.io/controller-expand-secret-name"] = cephFSProvisionerSecretName
 
-	sc.Parameters["csi.storage.k8s.io/node-stage-secret-namespace"] = rookNamespace
-	sc.Parameters["csi.storage.k8s.io/node-stage-secret-name"] = cephfsNodePluginSecretName
+	sc.Parameters["csi.storage.k8s.io/node-stage-secret-namespace"] = cephCSINamespace
+	sc.Parameters["csi.storage.k8s.io/node-stage-secret-name"] = cephFSNodePluginSecretName
 
 	if enablePool {
 		sc.Parameters["pool"] = "myfs-data0"
@@ -80,25 +80,21 @@ func createCephfsStorageClass(c kubernetes.Interface, f *framework.Framework, en
 	return err
 }
 
-func createCephfsSecret(c kubernetes.Interface, f *framework.Framework) error {
+func createCephfsSecret(f *framework.Framework, secretName, userName, userKey string) error {
 	scPath := fmt.Sprintf("%s/%s", cephfsExamplePath, "secret.yaml")
 	sc, err := getSecret(scPath)
 	if err != nil {
 		return err
 	}
-	adminKey, stdErr, err := execCommandInToolBoxPod(f, "ceph auth get-key client.admin", rookNamespace)
-	if err != nil {
-		return err
+	if secretName != "" {
+		sc.Name = secretName
 	}
-	if stdErr != "" {
-		return fmt.Errorf("error getting admin key %v", stdErr)
-	}
-	sc.StringData["adminID"] = adminUser
-	sc.StringData["adminKey"] = adminKey
+	sc.StringData["adminID"] = userName
+	sc.StringData["adminKey"] = userKey
 	delete(sc.StringData, "userID")
 	delete(sc.StringData, "userKey")
 	sc.Namespace = cephCSINamespace
-	_, err = c.CoreV1().Secrets(cephCSINamespace).Create(context.TODO(), &sc, metav1.CreateOptions{})
+	_, err = f.ClientSet.CoreV1().Secrets(cephCSINamespace).Create(context.TODO(), &sc, metav1.CreateOptions{})
 	return err
 }
 
@@ -137,4 +133,17 @@ func listCephFSSubVolumes(f *framework.Framework, filesystem, groupname string) 
 		return subVols, err
 	}
 	return subVols, nil
+}
+
+// getSubvolumepath validates whether subvolumegroup is present.
+func getSubvolumePath(f *framework.Framework, filesystem, subvolgrp, subvolume string) (string, error) {
+	cmd := fmt.Sprintf("ceph fs subvolume getpath %s %s --group_name=%s", filesystem, subvolume, subvolgrp)
+	stdOut, stdErr, err := execCommandInToolBoxPod(f, cmd, rookNamespace)
+	if err != nil {
+		return "", err
+	}
+	if stdErr != "" {
+		return "", fmt.Errorf("failed to getpath for subvolume %s with error %s", subvolume, stdErr)
+	}
+	return strings.TrimSpace(stdOut), nil
 }

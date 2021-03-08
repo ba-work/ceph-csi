@@ -33,8 +33,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/kubernetes/pkg/util/resizefs"
+	mount "k8s.io/mount-utils"
 	utilexec "k8s.io/utils/exec"
-	"k8s.io/utils/mount"
 )
 
 // NodeServer struct of ceph rbd driver with supported methods of CSI
@@ -790,7 +790,24 @@ func (ns *NodeServer) processEncryptedDevice(ctx context.Context, volOptions *rb
 		return "", err
 	}
 
-	if encrypted == rbdImageRequiresEncryption {
+	switch {
+	case encrypted == rbdImageRequiresEncryption:
+		// If we get here, it means the image was created with a
+		// ceph-csi version that creates a passphrase for the encrypted
+		// device in NodeStage. New versions moved that to
+		// CreateVolume.
+		// Use the same setupEncryption() as CreateVolume does, and
+		// continue with the common process to crypt-format the device.
+		err = volOptions.setupEncryption(ctx)
+		if err != nil {
+			util.ErrorLog(ctx, "failed to setup encryption for rbd"+
+				"image %s: %v", imageSpec, err)
+			return "", err
+		}
+
+		// make sure we continue with the encrypting of the device
+		fallthrough
+	case encrypted == rbdImageEncryptionPrepared:
 		diskMounter := &mount.SafeFormatAndMount{Interface: ns.mounter, Exec: utilexec.New()}
 		// TODO: update this when adding support for static (pre-provisioned) PVs
 		var existingFormat string
@@ -801,7 +818,7 @@ func (ns *NodeServer) processEncryptedDevice(ctx context.Context, volOptions *rb
 
 		switch existingFormat {
 		case "":
-			err = encryptDevice(ctx, volOptions, devicePath)
+			err = volOptions.encryptDevice(ctx, devicePath)
 			if err != nil {
 				return "", fmt.Errorf("failed to encrypt rbd image %s: %w", imageSpec, err)
 			}
@@ -816,69 +833,17 @@ func (ns *NodeServer) processEncryptedDevice(ctx context.Context, volOptions *rb
 			return "", fmt.Errorf("can not encrypt rbdImage %s that already has file system: %s",
 				imageSpec, existingFormat)
 		}
-	} else if encrypted != rbdImageEncrypted {
+	case encrypted != rbdImageEncrypted:
 		return "", fmt.Errorf("rbd image %s found mounted with unexpected encryption status %s",
 			imageSpec, encrypted)
 	}
 
-	devicePath, err = openEncryptedDevice(ctx, volOptions, devicePath)
+	devicePath, err = volOptions.openEncryptedDevice(ctx, devicePath)
 	if err != nil {
 		return "", err
 	}
 
 	return devicePath, nil
-}
-
-func encryptDevice(ctx context.Context, rbdVol *rbdVolume, devicePath string) error {
-	passphrase, err := util.GetCryptoPassphrase(ctx, rbdVol.VolID, rbdVol.KMS)
-	if err != nil {
-		util.ErrorLog(ctx, "failed to get crypto passphrase for %s: %v",
-			rbdVol, err)
-		return err
-	}
-
-	if err = util.EncryptVolume(ctx, devicePath, passphrase); err != nil {
-		err = fmt.Errorf("failed to encrypt volume %s: %w", rbdVol, err)
-		util.ErrorLog(ctx, err.Error())
-		return err
-	}
-
-	err = rbdVol.ensureEncryptionMetadataSet(rbdImageEncrypted)
-	if err != nil {
-		util.ErrorLog(ctx, err.Error())
-		return err
-	}
-
-	return nil
-}
-
-func openEncryptedDevice(ctx context.Context, volOptions *rbdVolume, devicePath string) (string, error) {
-	passphrase, err := util.GetCryptoPassphrase(ctx, volOptions.VolID, volOptions.KMS)
-	if err != nil {
-		util.ErrorLog(ctx, "failed to get passphrase for encrypted device %s: %v",
-			volOptions, err)
-		return "", status.Error(codes.Internal, err.Error())
-	}
-
-	mapperFile, mapperFilePath := util.VolumeMapper(volOptions.VolID)
-
-	isOpen, err := util.IsDeviceOpen(ctx, mapperFilePath)
-	if err != nil {
-		util.ErrorLog(ctx, "failed to check device %s encryption status: %s", devicePath, err)
-		return devicePath, err
-	}
-	if isOpen {
-		util.DebugLog(ctx, "encrypted device is already open at %s", mapperFilePath)
-	} else {
-		err = util.OpenEncryptedVolume(ctx, devicePath, mapperFile, passphrase)
-		if err != nil {
-			util.ErrorLog(ctx, "failed to open device %s: %v",
-				volOptions, err)
-			return devicePath, err
-		}
-	}
-
-	return mapperFilePath, nil
 }
 
 // xfsSupportsReflink checks if mkfs.xfs supports the "-m reflink=0|1"

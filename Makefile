@@ -19,11 +19,21 @@ CONTAINER_CMD?=$(shell podman version >/dev/null 2>&1 && echo podman)
 ifeq ($(CONTAINER_CMD),)
     CONTAINER_CMD=$(shell docker version >/dev/null 2>&1 && echo docker)
 endif
-CPUS?=$(shell nproc --ignore=1)
-CPUSET?=--cpuset-cpus=0-${CPUS}
+
+# Recent versions of Podman do not allow non-root to use --cpuset options.
+# Set HAVE_CPUSET to 1 when cpuset support is available.
+ifeq ($(UID),0)
+    HAVE_CPUSET ?= $(shell grep -c -w cpuset /sys/fs/cgroup/cgroup.controllers 2>/dev/null)
+else
+    HAVE_CPUSET ?= $(shell grep -c -w cpuset /sys/fs/cgroup/user.slice/user-$(UID).slice/cgroup.controllers 2>/dev/null)
+endif
+ifeq ($(HAVE_CPUSET),1)
+    CPUS ?= $(shell nproc --ignore=1)
+    CPUSET ?= --cpuset-cpus=0-${CPUS}
+endif
 
 CSI_IMAGE_NAME=$(if $(ENV_CSI_IMAGE_NAME),$(ENV_CSI_IMAGE_NAME),quay.io/cephcsi/cephcsi)
-CSI_IMAGE_VERSION=$(if $(ENV_CSI_IMAGE_VERSION),$(ENV_CSI_IMAGE_VERSION),canary)
+CSI_IMAGE_VERSION=$(shell . $(CURDIR)/build.env ; echo $${CSI_IMAGE_VERSION})
 CSI_IMAGE=$(CSI_IMAGE_NAME):$(CSI_IMAGE_VERSION)
 
 # Pass USE_PULLED_IMAGE=yes to skip building a new :test or :devel image.
@@ -68,7 +78,7 @@ endif
 
 # Pass GIT_SINCE for the range of commits to test. Used with the commitlint
 # target.
-GIT_SINCE := origin/master
+GIT_SINCE := origin/devel
 
 SELINUX := $(shell getenforce 2>/dev/null)
 ifeq ($(SELINUX),Enforcing)

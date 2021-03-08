@@ -59,7 +59,7 @@ func init() {
 type rbdDeviceInfo struct {
 	ID             string `json:"id"`
 	Pool           string `json:"pool"`
-	RadosNamespace string `json:"radosNamespace"`
+	RadosNamespace string `json:"namespace"`
 	Name           string `json:"name"`
 	Device         string `json:"device"`
 }
@@ -71,7 +71,7 @@ type rbdDeviceInfo struct {
 type nbdDeviceInfo struct {
 	ID             int64  `json:"id"`
 	Pool           string `json:"pool"`
-	RadosNamespace string `json:"radosNamespace"`
+	RadosNamespace string `json:"namespace"`
 	Name           string `json:"image"`
 	Device         string `json:"device"`
 }
@@ -208,14 +208,40 @@ func attachRBDImage(ctx context.Context, volOptions *rbdVolume, cr *util.Credent
 	return devicePath, err
 }
 
+func appendDeviceTypeAndOptions(cmdArgs []string, isNbd, isThick bool, userOptions string) []string {
+	accessType := accessTypeKRbd
+	if isNbd {
+		accessType = accessTypeNbd
+	}
+
+	cmdArgs = append(cmdArgs, "--device-type", accessType)
+	if !isNbd {
+		// Enable mapping and unmapping images from a non-initial network
+		// namespace (e.g. for Multus CNI).  The network namespace must be
+		// owned by the initial user namespace.
+		cmdArgs = append(cmdArgs, "--options", "noudev")
+	}
+	if isThick {
+		// When an image is thick-provisioned, any discard/unmap/trim
+		// requests should not free extents.
+		cmdArgs = append(cmdArgs, "--options", "notrim")
+	}
+	if userOptions != "" {
+		// userOptions is appended after, possibly overriding the above
+		// default options.
+		cmdArgs = append(cmdArgs, "--options", userOptions)
+	}
+
+	return cmdArgs
+}
+
 func createPath(ctx context.Context, volOpt *rbdVolume, cr *util.Credentials) (string, error) {
 	isNbd := false
 	imagePath := volOpt.String()
 
 	util.TraceLog(ctx, "rbd: map mon %s", volOpt.Monitors)
 
-	// Map options
-	mapOptions := []string{
+	mapArgs := []string{
 		"--id", cr.ID,
 		"-m", volOpt.Monitors,
 		"--keyfile=" + cr.KeyFile,
@@ -223,24 +249,23 @@ func createPath(ctx context.Context, volOpt *rbdVolume, cr *util.Credentials) (s
 	}
 
 	// Choose access protocol
-	accessType := accessTypeKRbd
 	if volOpt.Mounter == rbdTonbd && hasNBD {
 		isNbd = true
-		accessType = accessTypeNbd
 	}
 
-	// Update options with device type selection
-	mapOptions = append(mapOptions, "--device-type", accessType)
+	// check if the image should stay thick-provisioned
+	isThick, err := volOpt.isThickProvisioned()
+	if err != nil {
+		util.WarningLog(ctx, "failed to detect if image %q is thick-provisioned: %v", volOpt.String(), err)
+	}
 
+	mapArgs = appendDeviceTypeAndOptions(mapArgs, isNbd, isThick, volOpt.MapOptions)
 	if volOpt.readOnly {
-		mapOptions = append(mapOptions, "--read-only")
+		mapArgs = append(mapArgs, "--read-only")
 	}
 
-	if volOpt.MapOptions != "" {
-		mapOptions = append(mapOptions, "--options", volOpt.MapOptions)
-	}
 	// Execute map
-	stdout, stderr, err := util.ExecCommand(ctx, rbd, mapOptions...)
+	stdout, stderr, err := util.ExecCommand(ctx, rbd, mapArgs...)
 	if err != nil {
 		util.WarningLog(ctx, "rbd: map error %v, rbd output: %s", err, stderr)
 		// unmap rbd image if connection timeout
@@ -290,7 +315,7 @@ func detachRBDDevice(ctx context.Context, devicePath, volumeID, unmapOptions str
 
 // detachRBDImageOrDeviceSpec detaches an rbd imageSpec or devicePath, with additional checking
 // when imageSpec is used to decide if image is already unmapped.
-func detachRBDImageOrDeviceSpec(ctx context.Context, imageOrDeviceSpec string, isImageSpec, ndbType, encrypted bool, volumeID, unmapOptions string) error {
+func detachRBDImageOrDeviceSpec(ctx context.Context, imageOrDeviceSpec string, isImageSpec, isNbd, encrypted bool, volumeID, unmapOptions string) error {
 	if encrypted {
 		mapperFile, mapperPath := util.VolumeMapper(volumeID)
 		mappedDevice, mapper, err := util.DeviceEncryptionStatus(ctx, mapperPath)
@@ -311,15 +336,10 @@ func detachRBDImageOrDeviceSpec(ctx context.Context, imageOrDeviceSpec string, i
 		}
 	}
 
-	accessType := accessTypeKRbd
-	if ndbType {
-		accessType = accessTypeNbd
-	}
-	options := []string{"unmap", "--device-type", accessType, imageOrDeviceSpec}
-	if unmapOptions != "" {
-		options = append(options, "--options", unmapOptions)
-	}
-	_, stderr, err := util.ExecCommand(ctx, rbd, options...)
+	unmapArgs := []string{"unmap", imageOrDeviceSpec}
+	unmapArgs = appendDeviceTypeAndOptions(unmapArgs, isNbd, false, unmapOptions)
+
+	_, stderr, err := util.ExecCommand(ctx, rbd, unmapArgs...)
 	if err != nil {
 		// Messages for krbd and nbd differ, hence checking either of them for missing mapping
 		// This is not applicable when a device path is passed in

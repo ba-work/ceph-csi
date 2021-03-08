@@ -55,7 +55,7 @@ make image-cephcsi
 | `dataPool`                                                                                          | no                   | Ceph pool used for the data of the RBD images.                                                                                                                                                                          |
 | `volumeNamePrefix`                                                                                  | no                   | Prefix to use for naming RBD images (defaults to `csi-vol-`).                                                                                                                                                           |
 | `snapshotNamePrefix`                                                                                | no                   | Prefix to use for naming RBD snapshot images (defaults to `csi-snap-`).                                                                                                                                                 |
-| `imageFeatures`                                                                                     | yes                  | RBD image features. CSI RBD currently supports only `layering` feature. See [man pages](http://docs.ceph.com/docs/master/man/8/rbd/#cmdoption-rbd-image-feature)                                                        |
+| `imageFeatures`                                                                                     | yes                  | RBD image features. CSI RBD currently supports only `layering` feature. See [man pages](http://docs.ceph.com/docs/master/man/8/rbd/#cmdoption-rbd-image-feature) Note that the required support for [object-map and fast-diff were added in 5.3 and journaling does not have KRBD support yet](https://docs.ceph.com/en/latest/rbd/rbd-config-ref/#image-features) which is why they are unsupported here. deep-flatten is added for cloned images. |
 | `mapOptions`                                                                                        | no                   | Map options to use when mapping rbd image. See [krbd](https://docs.ceph.com/docs/master/man/8/rbd/#kernel-rbd-krbd-options) and [nbd](https://docs.ceph.com/docs/master/man/8/rbd-nbd/#options) options.                |
 | `unmapOptions`                                                                                      | no                   | Unmap options to use when unmapping rbd image. See [krbd](https://docs.ceph.com/docs/master/man/8/rbd/#kernel-rbd-krbd-options) and [nbd](https://docs.ceph.com/docs/master/man/8/rbd-nbd/#options) options.            |
 | `csi.storage.k8s.io/provisioner-secret-name`, `csi.storage.k8s.io/node-stage-secret-name`           | yes (for Kubernetes) | name of the Kubernetes Secret object containing Ceph client credentials. Both parameters should have the same value                                                                                                     |
@@ -63,6 +63,7 @@ make image-cephcsi
 | `mounter`                                                                                           | no                   | if set to `rbd-nbd`, use `rbd-nbd` on nodes that have `rbd-nbd` and `nbd` kernel modules to map rbd images                                                                                                              |
 | `encrypted`                                                                                         | no                   | disabled by default, use `"true"` to enable LUKS encryption on PVC and `"false"` to disable it. **Do not change for existing storageclasses**                                                                           |
 | `encryptionKMSID`                                                                                   | no                   | required if encryption is enabled and a kms is used to store passphrases                                                                                                                                                |
+| `thickProvision`                                                                                    | no                   | if set to `"true"`, newly created RBD images will be completely allocated by writing zeros to it                                                                                                                        |
 
 **NOTE:** An accompanying CSI configuration file, needs to be provided to the
 running pods. Refer to [Creating CSI configuration](../examples/README.md#creating-csi-configuration)
@@ -189,7 +190,8 @@ possible to encrypt them with ceph-csi by using LUKS encryption.
 
 * create volume request received
 * volume requested to be created in Ceph
-* encrypted state "requiresEncryption" is saved in image-meta in Ceph
+* new passphrase is generated and stored in selected KMS if KMS is in use
+* encrypted state "encryptionPrepared" is saved in image-meta in Ceph
 
 **Attach volume**:
 
@@ -197,8 +199,8 @@ possible to encrypt them with ceph-csi by using LUKS encryption.
 * volume is attached to provisioner container
 * on first time attachment
   (no file system on the attached device, checked with blkid)
-  * new passphrase is generated and stored in selected KMS if KMS is in use
-  * device is encrypted with LUKS using a passphrase from K8s secrets.
+  * passphrase is retrieved from selected KMS if KMS is in use
+  * device is encrypted with LUKS using a passphrase from K8s Secret or KMS
   * image-meta updated to "encrypted" in Ceph
 * passphrase is retrieved from selected KMS if KMS is in use
 * device is open and device path is changed to use a mapper device
@@ -229,29 +231,46 @@ To further improve security robustness it is possible to use unique passphrases
 generated for each volume and stored in a Key Management System (KMS). Currently
 HashiCorp Vault is the only KMS supported.
 
+There are two options to use Hashicorp Vault as a KMS:
+
+1. with Kubernetes ServiceAccount
+1. with a Vault Token per Tenant (a Kubernetes Namespace)
+
 To use Vault as KMS set `encryptionKMSID` to a unique identifier for Vault
 configuration. You will also need to create vault configuration similar to the
-[example](../examples/rbd/kms-config.yaml) and use same `encryptionKMSID`.
-Configuration must include `encryptionKMSType: "vault"`. In order for ceph-csi
-to be able to access the configuration you will need to have it mounted to
-csi-rbdplugin containers in both daemonset (so kms client can be instantiated to
-encrypt/decrypt volumes) and deployment pods (so kms client can be instantiated
-to delete passphrase on volume delete) `ceph-csi-encryption-kms-config`
-configmap.
+[example](../examples/kms/vault/kms-config.yaml) and use same
+`encryptionKMSID`.
+
+To use the Kubernetes ServiceAccount to access Vault, the configuration must
+include `encryptionKMSType: "vault"`. If Tenants are expected to place their
+Vault Token in a Kubernetes Secret in their Namespace, set `encryptionKMSType:
+"vaulttokens"`.
+
+In order for ceph-csi to be able to access the configuration you will need to
+have it mounted to csi-rbdplugin containers in both daemonset (so kms client
+can be instantiated to encrypt/decrypt volumes) and deployment pods (so kms
+client can be instantiated to delete passphrase on volume delete)
+`ceph-csi-encryption-kms-config` configmap.
 
 > Note: kms configuration must be a map of string values only
 > (`map[string]string`) so for numerical and boolean values make sure to put
 > quotes around.
 
-#### Configuring HashiCorp Vault
+When the Tenants need to provide their own Vault Token, they will need to place
+it in a Kubernetes Secret (by default) called `ceph-csi-kms-token`, where the
+Vault Token is stored in the `token` key as shown in [the
+example](../examples/kms/vault/tenant-token.yaml).
+
+#### Configuring HashiCorp Vault with Kubernetes ServiceAccount
 
 Using Vault as KMS you need to configure Kubernetes authentication method as
 described in [official
 documentation](https://www.vaultproject.io/docs/auth/kubernetes.html).
 
 If token reviewer is used, you will need to configure service account for
-that also like in [example](../examples/rbd/csi-vaulttokenreview-rbac.yaml) to
-be able to review jwt tokens.
+that also like in
+[example](../examples/kms/vault/csi-vaulttokenreview-rbac.yaml) to be able to
+review jwt tokens.
 
 Configure a role(s) for service accounts used for ceph-csi:
 

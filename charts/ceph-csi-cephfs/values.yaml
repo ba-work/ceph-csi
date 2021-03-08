@@ -18,7 +18,7 @@ serviceAccounts:
     name:
 
 # Configuration for the CSI to connect to the cluster
-# Ref: https://github.com/ceph/ceph-csi/blob/master/examples/README.md
+# Ref: https://github.com/ceph/ceph-csi/blob/devel/examples/README.md
 # Example:
 # csiConfig:
 #   - clusterID: "<cluster-id>"
@@ -38,6 +38,10 @@ nodeplugin:
   name: nodeplugin
   # if you are using ceph-fuse client set this value to OnDelete
   updateStrategy: RollingUpdate
+
+  # set user created priorityclassName for csi plugin pods. default is
+  # system-node-critical which is highest priority
+  priorityClassName: system-node-critical
 
   httpMetrics:
     # Metrics only available for cephcsi/cephcsi => 1.2.0
@@ -104,6 +108,10 @@ provisioner:
   replicaCount: 3
   # Timeout for waiting for creation or deletion of a volume
   timeout: 60s
+
+  # set user created priorityclassName for csi provisioner pods. default is
+  # system-cluster-critical which is less priority than system-node-critical
+  priorityClassName: system-cluster-critical
 
   httpMetrics:
     # Metrics only available for cephcsi/cephcsi => 1.2.0

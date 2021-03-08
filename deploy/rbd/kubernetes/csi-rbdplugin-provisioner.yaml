@@ -40,6 +40,7 @@ spec:
                       - csi-rbdplugin-provisioner
               topologyKey: "kubernetes.io/hostname"
       serviceAccount: rbd-csi-provisioner
+      priorityClassName: system-cluster-critical
       containers:
         - name: csi-provisioner
           image: k8s.gcr.io/sig-storage/csi-provisioner:v2.0.4
@@ -133,6 +134,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # - name: POD_NAMESPACE
+            #   valueFrom:
+            #     fieldRef:
+            #       fieldPath: spec.namespace
+            # - name: KMS_CONFIGMAP_NAME
+            #   value: encryptionConfig
             - name: CSI_ENDPOINT
               value: unix:///csi/csi-provisioner.sock
           imagePullPolicy: "IfNotPresent"

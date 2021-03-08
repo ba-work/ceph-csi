@@ -15,7 +15,6 @@ import (
 	"k8s.io/cloud-provider/volume/helpers"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2elog "k8s.io/kubernetes/test/e2e/framework/log"
-	testutils "k8s.io/kubernetes/test/utils"
 )
 
 func expandPVCSize(c kubernetes.Interface, pvc *v1.PersistentVolumeClaim, size string, t int) error {
@@ -40,7 +39,7 @@ func expandPVCSize(c kubernetes.Interface, pvc *v1.PersistentVolumeClaim, size s
 		updatedPVC, err = c.CoreV1().PersistentVolumeClaims(updatedPVC.Namespace).Get(context.TODO(), pvcName, metav1.GetOptions{})
 		if err != nil {
 			e2elog.Logf("Error getting pvc in namespace: '%s': %v", updatedPVC.Namespace, err)
-			if testutils.IsRetryableAPIError(err) {
+			if isRetryableAPIError(err) {
 				return false, nil
 			}
 			return false, err
@@ -53,7 +52,7 @@ func expandPVCSize(c kubernetes.Interface, pvc *v1.PersistentVolumeClaim, size s
 			}
 		}
 
-		if updatedPVC.Status.Capacity[v1.ResourceStorage] != resource.MustParse(size) {
+		if !updatedPVC.Status.Capacity[v1.ResourceStorage].Equal(resource.MustParse(size)) {
 			e2elog.Logf("current size in status %v,expected size %v", updatedPVC.Status.Capacity[v1.ResourceStorage], resource.MustParse(size))
 			return false, nil
 		}
@@ -170,11 +169,15 @@ func checkAppMntSize(f *framework.Framework, opt *metav1.ListOptions, size, cmd,
 			return false, nil
 		}
 		s := resource.MustParse(strings.TrimSpace(output))
-		actualSize := helpers.RoundUpToGiB(s)
-
+		actualSize, err := helpers.RoundUpToGiB(s)
+		if err != nil {
+			return false, err
+		}
 		s = resource.MustParse(size)
-		expectedSize := helpers.RoundUpToGiB(s)
-
+		expectedSize, err := helpers.RoundUpToGiB(s)
+		if err != nil {
+			return false, err
+		}
 		if actualSize != expectedSize {
 			e2elog.Logf("expected size %s found %s information", size, output)
 			return false, nil

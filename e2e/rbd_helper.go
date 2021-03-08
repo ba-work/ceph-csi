@@ -37,13 +37,13 @@ func createRBDStorageClass(c kubernetes.Interface, f *framework.Framework, scOpt
 		return nil
 	}
 	sc.Parameters["pool"] = defaultRBDPool
-	sc.Parameters["csi.storage.k8s.io/provisioner-secret-namespace"] = rookNamespace
+	sc.Parameters["csi.storage.k8s.io/provisioner-secret-namespace"] = cephCSINamespace
 	sc.Parameters["csi.storage.k8s.io/provisioner-secret-name"] = rbdProvisionerSecretName
 
-	sc.Parameters["csi.storage.k8s.io/controller-expand-secret-namespace"] = rookNamespace
+	sc.Parameters["csi.storage.k8s.io/controller-expand-secret-namespace"] = cephCSINamespace
 	sc.Parameters["csi.storage.k8s.io/controller-expand-secret-name"] = rbdProvisionerSecretName
 
-	sc.Parameters["csi.storage.k8s.io/node-stage-secret-namespace"] = rookNamespace
+	sc.Parameters["csi.storage.k8s.io/node-stage-secret-namespace"] = cephCSINamespace
 	sc.Parameters["csi.storage.k8s.io/node-stage-secret-name"] = rbdNodePluginSecretName
 
 	fsID, stdErr, err := execCommandInToolBoxPod(f, "ceph fsid", rookNamespace)
@@ -118,28 +118,19 @@ func createRadosNamespace(f *framework.Framework) error {
 	return nil
 }
 
-func createRBDSecret(c kubernetes.Interface, f *framework.Framework) error {
+func createRBDSecret(f *framework.Framework, secretName, userName, userKey string) error {
 	scPath := fmt.Sprintf("%s/%s", rbdExamplePath, "secret.yaml")
 	sc, err := getSecret(scPath)
 	if err != nil {
 		return err
 	}
-	adminKey, stdErr, err := execCommandInToolBoxPod(f, "ceph auth get-key client.admin", rookNamespace)
-	if err != nil {
-		return err
+	if secretName != "" {
+		sc.Name = secretName
 	}
-	if stdErr != "" {
-		return fmt.Errorf("error getting admin key %v", stdErr)
-	}
-	sc.StringData["userID"] = adminUser
-	sc.StringData["userKey"] = adminKey
+	sc.StringData["userID"] = userName
+	sc.StringData["userKey"] = userKey
 	sc.Namespace = cephCSINamespace
-	_, err = c.CoreV1().Secrets(cephCSINamespace).Create(context.TODO(), &sc, metav1.CreateOptions{})
-	if err != nil {
-		return err
-	}
-
-	err = updateSecretForEncryption(c)
+	_, err = f.ClientSet.CoreV1().Secrets(cephCSINamespace).Create(context.TODO(), &sc, metav1.CreateOptions{})
 	return err
 }
 
@@ -310,6 +301,63 @@ func deleteBackingRBDImage(f *framework.Framework, pvc *v1.PersistentVolumeClaim
 	}
 
 	cmd := fmt.Sprintf("rbd rm %s %s", rbdOptions(defaultRBDPool), imageData.imageName)
+	_, _, err = execCommandInToolBoxPod(f, cmd, rookNamespace)
+	return err
+}
+
+// rbdDuImage contains the disk-usage statistics of an RBD image.
+type rbdDuImage struct {
+	Name            string `json:"name"`
+	ProvisionedSize uint64 `json:"provisioned_size"`
+	UsedSize        uint64 `json:"used_size"`
+}
+
+// rbdDuImageList contains the list of images returned by 'rbd du'.
+type rbdDuImageList struct {
+	Images []*rbdDuImage `json:"images"`
+}
+
+// getRbdDu runs 'rbd du' on the RBD image and returns a rbdDuImage struct with
+// the result.
+func getRbdDu(f *framework.Framework, pvc *v1.PersistentVolumeClaim) (*rbdDuImage, error) {
+	rdil := rbdDuImageList{}
+
+	imageData, err := getImageInfoFromPVC(pvc.Namespace, pvc.Name, f)
+	if err != nil {
+		return nil, err
+	}
+
+	cmd := fmt.Sprintf("rbd du --format=json %s %s", rbdOptions(defaultRBDPool), imageData.imageName)
+	stdout, _, err := execCommandInToolBoxPod(f, cmd, rookNamespace)
+	if err != nil {
+		return nil, err
+	}
+
+	err = json.Unmarshal([]byte(stdout), &rdil)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, image := range rdil.Images {
+		if image.Name == imageData.imageName {
+			return image, nil
+		}
+	}
+
+	return nil, fmt.Errorf("image %s not found", imageData.imageName)
+}
+
+// sparsifyBackingRBDImage runs `rbd sparsify` on the RBD image. Once done, all
+// data blocks that contain zeros are discarded/trimmed/unmapped and do not
+// take up any space anymore. This can be used to verify that an empty, but
+// allocated (with zerofill) extents have been released.
+func sparsifyBackingRBDImage(f *framework.Framework, pvc *v1.PersistentVolumeClaim) error {
+	imageData, err := getImageInfoFromPVC(pvc.Namespace, pvc.Name, f)
+	if err != nil {
+		return err
+	}
+
+	cmd := fmt.Sprintf("rbd sparsify %s %s", rbdOptions(defaultRBDPool), imageData.imageName)
 	_, _, err = execCommandInToolBoxPod(f, cmd, rookNamespace)
 	return err
 }

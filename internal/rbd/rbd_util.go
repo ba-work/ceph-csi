@@ -54,11 +54,8 @@ const (
 	rbdTaskRemoveCmdInvalidString2      = "Error EINVAL: invalid command"
 	rbdTaskRemoveCmdAccessDeniedMessage = "Error EACCES:"
 
-	// Encryption statuses for RbdImage
-	rbdImageEncrypted          = "encrypted"
-	rbdImageRequiresEncryption = "requiresEncryption"
-	// image metadata key for encryption
-	encryptionMetaKey = ".rbd.csi.ceph.com/encrypted"
+	// image metadata key for thick-provisioning
+	thickProvisionMetaKey = ".rbd.csi.ceph.com/thick-provisioned"
 )
 
 // rbdVolume represents a CSI volume and its RBD image specifics.
@@ -104,6 +101,7 @@ type rbdVolume struct {
 	Encrypted           bool
 	readOnly            bool
 	Primary             bool
+	ThickProvision      bool
 	KMS                 util.EncryptionKMS
 	// Owner is the creator (tenant, Kubernetes Namespace) of the volume.
 	Owner     string
@@ -169,6 +167,9 @@ func (rv *rbdVolume) Destroy() {
 	if rv.conn != nil {
 		rv.conn.Destroy()
 	}
+	if rv.KMS != nil {
+		rv.KMS.Destroy()
+	}
 }
 
 // String returns the image-spec (pool/{namespace/}image) format of the image.
@@ -224,6 +225,24 @@ func createImage(ctx context.Context, pOpts *rbdVolume, cr *util.Credentials) er
 		uint64(util.RoundOffVolSize(pOpts.VolSize)*helpers.MiB), options)
 	if err != nil {
 		return fmt.Errorf("failed to create rbd image: %w", err)
+	}
+
+	if pOpts.ThickProvision {
+		err = pOpts.allocate(0)
+		if err != nil {
+			// nolint:errcheck // deleteImage() will log errors in
+			// case it fails, no need to log them here again
+			_ = deleteImage(ctx, pOpts, cr)
+			return fmt.Errorf("failed to thick provision image: %w", err)
+		}
+
+		err = pOpts.setThickProvisioned()
+		if err != nil {
+			// nolint:errcheck // deleteImage() will log errors in
+			// case it fails, no need to log them here again
+			_ = deleteImage(ctx, pOpts, cr)
+			return fmt.Errorf("failed to mark image as thick-provisioned: %w", err)
+		}
 	}
 
 	return nil
@@ -286,6 +305,45 @@ func (rv *rbdVolume) open() (*librbd.Image, error) {
 	return image, nil
 }
 
+// allocate uses the stripe-period of the image to fully allocate (thick
+// provision) the image.
+func (rv *rbdVolume) allocate(offset uint64) error {
+	// We do not want to call discard, we really want to write zeros to get
+	// the allocation. This sets the option for the re-used connection, and
+	// all subsequent images that are opened. That is not a problem, as
+	// this is the only place images get written.
+	err := rv.conn.DisableDiscardOnZeroedWriteSame()
+	if err != nil {
+		return err
+	}
+
+	image, err := rv.open()
+	if err != nil {
+		return err
+	}
+	defer image.Close()
+
+	st, err := image.Stat()
+	if err != nil {
+		return err
+	}
+
+	sc, err := image.GetStripeCount()
+	if err != nil {
+		return err
+	}
+
+	// zeroBlock is the stripe-period: size of the object-size multiplied
+	// by the stripe-count
+	zeroBlock := make([]byte, sc*(1<<st.Order))
+
+	// the actual size of the image as available in the pool, can be
+	// marginally different from the requested image size
+	_, err = image.WriteSame(offset, st.Size-offset, zeroBlock, rados.OpFlagNone)
+
+	return err
+}
+
 // isInUse checks if there is a watcher on the image. It returns true if there
 // is a watcher on the image, otherwise returns false.
 func (rv *rbdVolume) isInUse() (bool, error) {
@@ -339,7 +397,7 @@ func addRbdManagerTask(ctx context.Context, pOpts *rbdVolume, arg []string) (boo
 			util.WarningLog(ctx, "access denied to Ceph MGR-based rbd commands on cluster ID (%s)", pOpts.ClusterID)
 			supported = false
 		default:
-			util.WarningLog(ctx, "uncaught error while scheduling a task: %s", err)
+			util.WarningLog(ctx, "uncaught error while scheduling a task (%v): %s", err, stderr)
 		}
 	}
 	return supported, err
@@ -490,7 +548,7 @@ func (rv *rbdVolume) flattenRbdImage(ctx context.Context, cr *util.Credentials, 
 	}
 
 	if forceFlatten || (depth >= hardlimit) || (depth >= softlimit) {
-		args := []string{"flatten", rv.Pool + "/" + rv.RbdImageName, "--id", cr.ID, "--keyfile=" + cr.KeyFile, "-m", rv.Monitors}
+		args := []string{"flatten", rv.String(), "--id", cr.ID, "--keyfile=" + cr.KeyFile, "-m", rv.Monitors}
 		supported, err := addRbdManagerTask(ctx, rv, args)
 		if supported {
 			if err != nil {
@@ -740,7 +798,7 @@ func genVolFromVolID(ctx context.Context, volumeID string, cr *util.Credentials,
 
 	if imageAttributes.KmsID != "" {
 		rbdVol.Encrypted = true
-		rbdVol.KMS, err = util.GetKMS(imageAttributes.KmsID, secrets)
+		rbdVol.KMS, err = util.GetKMS(rbdVol.Owner, imageAttributes.KmsID, secrets)
 		if err != nil {
 			return rbdVol, err
 		}
@@ -769,7 +827,6 @@ func genVolFromVolumeOptions(ctx context.Context, volOptions, credentials map[st
 		ok         bool
 		err        error
 		namePrefix string
-		encrypted  string
 	)
 
 	rbdVol := &rbdVolume{}
@@ -816,33 +873,9 @@ func genVolFromVolumeOptions(ctx context.Context, volOptions, credentials map[st
 		rbdVol.Mounter = rbdDefaultMounter
 	}
 
-	// if the KMS is of type VaultToken, additional metadata is needed
-	// depending on the tenant, the KMS can be configured with other
-	// options
-	// FIXME: this works only on Kubernetes, how do other CO supply metadata?
-	rbdVol.Owner, ok = volOptions["csi.storage.k8s.io/pvc/namespace"]
-	if !ok {
-		util.DebugLog(ctx, "could not detect owner for %s", rbdVol.String())
-	}
-
-	rbdVol.Encrypted = false
-	encrypted, ok = volOptions["encrypted"]
-	if ok {
-		rbdVol.Encrypted, err = strconv.ParseBool(encrypted)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"invalid value set in 'encrypted': %s (should be \"true\" or \"false\")", encrypted)
-		}
-
-		if rbdVol.Encrypted {
-			// deliberately ignore if parsing failed as GetKMS will return default
-			// implementation of kmsID is empty
-			kmsID := volOptions["encryptionKMSID"]
-			rbdVol.KMS, err = util.GetKMS(kmsID, credentials)
-			if err != nil {
-				return nil, fmt.Errorf("invalid encryption kms configuration: %w", err)
-			}
-		}
+	err = rbdVol.initKMS(ctx, volOptions, credentials)
+	if err != nil {
+		return nil, err
 	}
 
 	return rbdVol, nil
@@ -1162,13 +1195,42 @@ func (rv *rbdVolume) resize(newSize int64) error {
 	}
 	defer image.Close()
 
+	thick, err := rv.isThickProvisioned()
+	if err != nil {
+		return err
+	}
+
+	// offset is used to track from where on the expansion is done, so that
+	// the extents can be allocated in case the image is thick-provisioned
+	var offset uint64
+	if thick {
+		st, statErr := image.Stat()
+		if statErr != nil {
+			return statErr
+		}
+
+		offset = st.Size
+	}
+
 	err = image.Resize(uint64(util.RoundOffVolSize(newSize) * helpers.MiB))
 	if err != nil {
 		return err
 	}
 
+	if thick {
+		err = rv.allocate(offset)
+		if err != nil {
+			resizeErr := image.Resize(offset)
+			if resizeErr != nil {
+				err = fmt.Errorf("failed to shrink image (%v) after failed allocation: %w", resizeErr, err)
+			}
+			return err
+		}
+	}
+
 	// update Volsize of rbdVolume object to newSize.
 	rv.VolSize = newSize
+
 	return nil
 }
 
@@ -1192,26 +1254,34 @@ func (rv *rbdVolume) SetMetadata(key, value string) error {
 	return image.SetMetadata(key, value)
 }
 
-// checkRbdImageEncrypted verifies if rbd image was encrypted when created.
-func (rv *rbdVolume) checkRbdImageEncrypted(ctx context.Context) (string, error) {
-	value, err := rv.GetMetadata(encryptionMetaKey)
+// setThickProvisioned records in the image metadata that it has been
+// thick-provisioned.
+func (rv *rbdVolume) setThickProvisioned() error {
+	err := rv.SetMetadata(thickProvisionMetaKey, "true")
 	if err != nil {
-		util.ErrorLog(ctx, "checking image %s encrypted state metadata failed: %s", rv, err)
-		return "", err
-	}
-
-	encrypted := strings.TrimSpace(value)
-	util.DebugLog(ctx, "image %s encrypted state metadata reports %q", rv, encrypted)
-	return encrypted, nil
-}
-
-func (rv *rbdVolume) ensureEncryptionMetadataSet(status string) error {
-	err := rv.SetMetadata(encryptionMetaKey, status)
-	if err != nil {
-		return fmt.Errorf("failed to save encryption status for %s: %w", rv, err)
+		return fmt.Errorf("failed to set metadata %q for %q: %w", thickProvisionMetaKey, rv.String(), err)
 	}
 
 	return nil
+}
+
+// isThickProvisioned checks in the image metadata if the image has been marked
+// as thick-provisioned. This can be used while expanding the image, so that
+// the expansion can be allocated too.
+func (rv *rbdVolume) isThickProvisioned() (bool, error) {
+	value, err := rv.GetMetadata(thickProvisionMetaKey)
+	if err != nil {
+		if err == librbd.ErrNotFound {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to get metadata %q for %q: %w", thickProvisionMetaKey, rv.String(), err)
+	}
+
+	thick, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("failed to convert %q=%q to a boolean: %w", thickProvisionMetaKey, value, err)
+	}
+	return thick, nil
 }
 
 func (rv *rbdVolume) listSnapshots() ([]librbd.SnapInfo, error) {
