@@ -21,3 +21,5 @@ deploy/cephcsi/image/cephcsi
 
 # generated golangci-lint configuration
 scripts/golangci.yml
+
+.venv/**
