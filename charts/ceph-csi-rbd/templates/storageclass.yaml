@@ -13,7 +13,7 @@ parameters:
   pool: {{ .Values.storageClass.pool }}
   imageFeatures: layering
   csi.storage.k8s.io/provisioner-secret-name: {{ .Values.secret.name }}
-  csi.storage.k8s.io/provisioner-secret-namespace: {{ .Release.namespace }}
+  csi.storage.k8s.io/provisioner-secret-namespace: {{ .Release.Namespace }}
   csi.storage.k8s.io/controller-expand-secret-name: {{ .Values.secret.name }}
   csi.storage.k8s.io/controller-expand-secret-namespace: {{ .Release.Namespace }}
   csi.storage.k8s.io/node-stage-secret-name: {{ .Values.secret.name }}
